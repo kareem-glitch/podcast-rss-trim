@@ -45,13 +45,36 @@ SPLIT_INTO_PARTS = True
 # real description. Any sentence appearing in this share of episodes is dropped,
 # so the character budget is spent on content Clay can actually score.
 STRIP_REPEATED_BOILERPLATE = True
-BOILERPLATE_MIN_SHARE = 0.10
+# Shows rotate their sponsors, so an individual ad read appears in well under a
+# tenth of episodes. 0.03 catches a sponsor that ran for a handful of weeks.
+BOILERPLATE_MIN_SHARE = 0.03
+
+# Rotating ad reads defeat frequency detection on their own, but they are nearly
+# always introduced by a stock phrase and run to the end of the description.
+# Everything from the first match is dropped. The guest intro comes first, so a
+# match inside the opening SPONSOR_CUT_FLOOR characters is ignored as a false
+# positive rather than beheading the episode.
+SPONSOR_CUT_MARKERS = [
+    r"This episode is brought to you by",
+    r"Thank you to our Season Partners",
+    r"Thanks? to our sponsors?\b",
+    r"Sponsored by\b",
+]
+SPONSOR_CUT_FLOOR = 120
 
 # ----------------------------------------------------------------------------
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _SENT_RE = re.compile(r"(?<=[.!?])\s+")
+_SPONSOR_RE = re.compile("|".join(SPONSOR_CUT_MARKERS), re.I)
+
+
+def cut_sponsor_tail(text: str) -> str:
+    match = _SPONSOR_RE.search(text)
+    if match and match.start() > SPONSOR_CUT_FLOOR:
+        return text[: match.start()].strip()
+    return text
 
 
 def sentences(text: str):
@@ -64,7 +87,7 @@ def find_boilerplate(texts):
         return set()
     counts = Counter()
     for t in texts:
-        for s in set(sentences(t)):
+        for s in set(sentences(cut_sponsor_tail(t))):
             counts[s] += 1
     threshold = max(3, int(len(texts) * BOILERPLATE_MIN_SHARE))
     return {s for s, n in counts.items() if n >= threshold}
@@ -73,6 +96,7 @@ def find_boilerplate(texts):
 def drop_boilerplate(text: str, boilerplate) -> str:
     if not boilerplate:
         return text
+    text = cut_sponsor_tail(text)
     kept = " ".join(s for s in sentences(text) if s not in boilerplate)
     # An episode whose whole description is boilerplate keeps its original text
     # rather than going out empty.
