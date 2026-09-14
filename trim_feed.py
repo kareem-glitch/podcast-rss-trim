@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Trim a podcast RSS feed down to something Clay's RSS source can read.
+"""Trim podcast RSS feeds down to something Clay's RSS source can read.
 
-Clay caps a source cell at 200kB. Feeds like Captivate's blow past that because
-every episode repeats the same sponsor boilerplate in both <description> and
-<content:encoded>. This script keeps four fields per episode, strips the HTML,
-caps the description, and drops the oldest episodes until the file is under the
-size ceiling.
+Clay caps a source cell at 200kB. Podcast feeds blow past that because every
+episode repeats the same sponsor boilerplate in both <description> and
+<content:encoded>. For each show this keeps four fields per episode, drops the
+repeated boilerplate, caps the description, and splits what is left across as
+many files as it takes to stay under the ceiling.
 
-Point FEED_URL at a different podcast to reuse it.
+Add a show by putting another entry in FEEDS.
 """
 
 import html
@@ -24,15 +24,20 @@ import feedparser
 
 # --- config -----------------------------------------------------------------
 
-FEED_URL = "https://feeds.captivate.fm/accounting-voices/"
-OUTPUT_PATH = "feed.xml"
+# One entry per show. "slug" names its output files: slug.xml, slug-2.xml ...
+# Accounting Voices keeps the slug "feed" because that URL is already wired into
+# Clay - renaming it would break the source.
+FEEDS = [
+    {"slug": "feed", "url": "https://feeds.captivate.fm/accounting-voices/"},
+    {"slug": "cdg", "url": "https://feeds.megaphone.fm/CREUR4523040176"},
+]
 
 MAX_EPISODES = 300          # keep the N most recent episodes
 MAX_DESCRIPTION_CHARS = 1200  # cap each description after HTML is stripped
 MAX_BYTES = 180 * 1024      # per-file ceiling (Clay's cap is 200kB)
 
 # Clay reads one file per RSS source, so an episode count that will not fit in
-# MAX_BYTES is split across feed.xml, feed-2.xml, feed-3.xml ... Add each as its
+# MAX_BYTES is split across slug.xml, slug-2.xml, slug-3.xml ... Add each as its
 # own source in Clay. Set to False to drop the oldest episodes instead.
 SPLIT_INTO_PARTS = True
 
@@ -142,12 +147,9 @@ def build_rss(channel_title, channel_link, channel_description, episodes) -> byt
     )
 
 
-def part_path(index: int) -> str:
-    """feed.xml, feed-2.xml, feed-3.xml ..."""
-    if index == 0:
-        return OUTPUT_PATH
-    stem, _, ext = OUTPUT_PATH.rpartition(".")
-    return f"{stem}-{index + 1}.{ext}"
+def part_path(slug: str, index: int) -> str:
+    """slug.xml, slug-2.xml, slug-3.xml ..."""
+    return f"{slug}.xml" if index == 0 else f"{slug}-{index + 1}.xml"
 
 
 def pack(episodes, channel):
@@ -162,9 +164,9 @@ def pack(episodes, channel):
     return episodes[:lo], episodes[lo:]
 
 
-def main() -> int:
-    print(f"Fetching {FEED_URL}")
-    parsed = feedparser.parse(FEED_URL)
+def run_feed(slug: str, url: str) -> int:
+    print(f"\n{slug}: fetching {url}")
+    parsed = feedparser.parse(url)
 
     if getattr(parsed, "bozo", 0) and not parsed.entries:
         print(f"ERROR: could not parse feed: {parsed.get('bozo_exception')}", file=sys.stderr)
@@ -175,7 +177,7 @@ def main() -> int:
 
     feed = parsed.feed
     channel_title = feed.get("title", "Podcast")
-    channel_link = feed.get("link", FEED_URL)
+    channel_link = feed.get("link", url)
     channel_description = strip_html(feed.get("description", "") or channel_title, 500)
     channel = (channel_title, channel_link, channel_description)
 
@@ -184,7 +186,7 @@ def main() -> int:
     raw = [strip_html(e.get("summary", "") or e.get("subtitle", ""), 10 ** 9) for e in entries]
     boilerplate = find_boilerplate(raw)
     if boilerplate:
-        print(f"Boilerplate sentences stripped: {len(boilerplate)}")
+        print(f"  boilerplate sentences stripped: {len(boilerplate)}")
 
     episodes = []
     for entry, text in zip(entries, raw):
@@ -218,21 +220,33 @@ def main() -> int:
 
     for i, chunk in enumerate(written):
         payload = build_rss(*channel, chunk)
-        with open(part_path(i), "wb") as fh:
+        path = part_path(slug, i)
+        with open(path, "wb") as fh:
             fh.write(payload)
         span = f"{chunk[-1]['pubDate'][:16]} .. {chunk[0]['pubDate'][:16]}"
-        print(f"  {part_path(i):<14} {len(chunk):>3} episodes  {len(payload) / 1024:>6.1f} kB   {span}")
+        print(f"  {path:<14} {len(chunk):>3} episodes  {len(payload) / 1024:>6.1f} kB   {span}")
 
     # Remove stale parts from a previous, larger run.
     i = len(written)
-    while os.path.exists(part_path(i)):
-        os.remove(part_path(i))
-        print(f"  removed stale {part_path(i)}")
+    while os.path.exists(part_path(slug, i)):
+        os.remove(part_path(slug, i))
+        print(f"  removed stale {part_path(slug, i)}")
         i += 1
 
-    print(f"Source episodes: {len(parsed.entries)}  |  kept: {sum(len(c) for c in written)}"
-          + (f"  |  dropped to fit: {dropped}" if dropped else ""))
+    print(f"  {channel_title}: {len(parsed.entries)} available, {sum(len(c) for c in written)} kept"
+          + (f", {dropped} dropped to fit" if dropped else ""))
     return 0
+
+
+def main() -> int:
+    failures = 0
+    for spec in FEEDS:
+        try:
+            failures += run_feed(spec["slug"], spec["url"])
+        except Exception as exc:  # one bad feed must not stop the others
+            print(f"ERROR: {spec['slug']} failed: {exc}", file=sys.stderr)
+            failures += 1
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
