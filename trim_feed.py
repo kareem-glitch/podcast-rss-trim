@@ -33,7 +33,10 @@ FEEDS = [
 ]
 
 MAX_EPISODES = 300          # keep the N most recent episodes
-MAX_DESCRIPTION_CHARS = 1200  # cap each description after HTML is stripped
+# None = never truncate an episode's own words. Clay scores ICP fit from this
+# text, so it is kept whole and the size budget is met by splitting into more
+# files instead. Set an integer to cap it again.
+MAX_DESCRIPTION_CHARS = None
 MAX_BYTES = 180 * 1024      # per-file ceiling (Clay's cap is 200kB)
 
 # Clay reads one file per RSS source, so an episode count that will not fit in
@@ -68,6 +71,16 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _SENT_RE = re.compile(r"(?<=[.!?])\s+")
 _SPONSOR_RE = re.compile("|".join(SPONSOR_CUT_MARKERS), re.I)
+
+
+def richest_text(entry) -> str:
+    """Whichever of description / content:encoded carries more of the episode."""
+    best = entry.get("summary", "") or entry.get("subtitle", "")
+    for block in entry.get("content", []) or []:
+        value = block.get("value", "")
+        if len(value) > len(best):
+            best = value
+    return best
 
 
 def cut_sponsor_tail(text: str) -> str:
@@ -207,7 +220,7 @@ def run_feed(slug: str, url: str) -> int:
 
     entries = sorted(parsed.entries, key=entry_timestamp, reverse=True)[:MAX_EPISODES]
 
-    raw = [strip_html(e.get("summary", "") or e.get("subtitle", ""), 10 ** 9) for e in entries]
+    raw = [strip_html(richest_text(e), 10 ** 9) for e in entries]
     boilerplate = find_boilerplate(raw)
     if boilerplate:
         print(f"  boilerplate sentences stripped: {len(boilerplate)}")
@@ -215,7 +228,7 @@ def run_feed(slug: str, url: str) -> int:
     episodes = []
     for entry, text in zip(entries, raw):
         body = drop_boilerplate(text, boilerplate)
-        if len(body) > MAX_DESCRIPTION_CHARS:
+        if MAX_DESCRIPTION_CHARS and len(body) > MAX_DESCRIPTION_CHARS:
             body = body[:MAX_DESCRIPTION_CHARS].rstrip()
             cut = body.rfind(" ")
             if cut > MAX_DESCRIPTION_CHARS * 0.8:
