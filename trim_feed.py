@@ -11,11 +11,14 @@ Point FEED_URL at a different podcast to reuse it.
 """
 
 import html
+import os
 import re
 import sys
 from email.utils import format_datetime, formatdate
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
+
+from collections import Counter
 
 import feedparser
 
@@ -24,14 +27,51 @@ import feedparser
 FEED_URL = "https://feeds.captivate.fm/accounting-voices/"
 OUTPUT_PATH = "feed.xml"
 
-MAX_EPISODES = 60           # keep the N most recent episodes
+MAX_EPISODES = 300          # keep the N most recent episodes
 MAX_DESCRIPTION_CHARS = 1200  # cap each description after HTML is stripped
-MAX_BYTES = 180 * 1024      # hard ceiling; oldest episodes are dropped to fit
+MAX_BYTES = 180 * 1024      # per-file ceiling (Clay's cap is 200kB)
+
+# Clay reads one file per RSS source, so an episode count that will not fit in
+# MAX_BYTES is split across feed.xml, feed-2.xml, feed-3.xml ... Add each as its
+# own source in Clay. Set to False to drop the oldest episodes instead.
+SPLIT_INTO_PARTS = True
+
+# Sponsor/preamble text repeats verbatim across most episodes and crowds out the
+# real description. Any sentence appearing in this share of episodes is dropped,
+# so the character budget is spent on content Clay can actually score.
+STRIP_REPEATED_BOILERPLATE = True
+BOILERPLATE_MIN_SHARE = 0.10
 
 # ----------------------------------------------------------------------------
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+_SENT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def sentences(text: str):
+    return [s.strip() for s in _SENT_RE.split(text) if len(s.strip()) > 25]
+
+
+def find_boilerplate(texts):
+    """Sentences repeated across the feed - sponsor reads, series preambles."""
+    if not STRIP_REPEATED_BOILERPLATE:
+        return set()
+    counts = Counter()
+    for t in texts:
+        for s in set(sentences(t)):
+            counts[s] += 1
+    threshold = max(3, int(len(texts) * BOILERPLATE_MIN_SHARE))
+    return {s for s, n in counts.items() if n >= threshold}
+
+
+def drop_boilerplate(text: str, boilerplate) -> str:
+    if not boilerplate:
+        return text
+    kept = " ".join(s for s in sentences(text) if s not in boilerplate)
+    # An episode whose whole description is boilerplate keeps its original text
+    # rather than going out empty.
+    return kept if len(kept) > 80 else text
 
 
 def strip_html(raw: str, limit: int = MAX_DESCRIPTION_CHARS) -> str:
@@ -102,6 +142,26 @@ def build_rss(channel_title, channel_link, channel_description, episodes) -> byt
     )
 
 
+def part_path(index: int) -> str:
+    """feed.xml, feed-2.xml, feed-3.xml ..."""
+    if index == 0:
+        return OUTPUT_PATH
+    stem, _, ext = OUTPUT_PATH.rpartition(".")
+    return f"{stem}-{index + 1}.{ext}"
+
+
+def pack(episodes, channel):
+    """Greedily fill one file up to MAX_BYTES; return (kept, remaining)."""
+    lo, hi = 0, len(episodes)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(build_rss(*channel, episodes[:mid])) <= MAX_BYTES:
+            lo = mid
+        else:
+            hi = mid - 1
+    return episodes[:lo], episodes[lo:]
+
+
 def main() -> int:
     print(f"Fetching {FEED_URL}")
     parsed = feedparser.parse(FEED_URL)
@@ -117,42 +177,61 @@ def main() -> int:
     channel_title = feed.get("title", "Podcast")
     channel_link = feed.get("link", FEED_URL)
     channel_description = strip_html(feed.get("description", "") or channel_title, 500)
+    channel = (channel_title, channel_link, channel_description)
 
     entries = sorted(parsed.entries, key=entry_timestamp, reverse=True)[:MAX_EPISODES]
 
+    raw = [strip_html(e.get("summary", "") or e.get("subtitle", ""), 10 ** 9) for e in entries]
+    boilerplate = find_boilerplate(raw)
+    if boilerplate:
+        print(f"Boilerplate sentences stripped: {len(boilerplate)}")
+
     episodes = []
-    for entry in entries:
-        raw_desc = entry.get("summary", "") or entry.get("subtitle", "")
+    for entry, text in zip(entries, raw):
+        body = drop_boilerplate(text, boilerplate)
+        if len(body) > MAX_DESCRIPTION_CHARS:
+            body = body[:MAX_DESCRIPTION_CHARS].rstrip()
+            cut = body.rfind(" ")
+            if cut > MAX_DESCRIPTION_CHARS * 0.8:
+                body = body[:cut]
+            body = body.rstrip(" ,;:-") + "\u2026"
         episodes.append(
             {
                 "title": entry.get("title", "").strip(),
-                "description": strip_html(raw_desc),
+                "description": body,
                 "link": entry.get("link", ""),
                 "pubDate": rfc822(entry),
                 "guid": entry.get("id", "") or entry.get("link", ""),
             }
         )
 
-    dropped = 0
-    while episodes:
-        payload = build_rss(channel_title, channel_link, channel_description, episodes)
-        if len(payload) <= MAX_BYTES:
+    remaining, written, dropped = episodes, [], 0
+    while remaining:
+        kept, remaining = pack(remaining, channel)
+        if not kept:
+            print("ERROR: a single episode exceeds the size ceiling", file=sys.stderr)
+            return 1
+        written.append(kept)
+        if not SPLIT_INTO_PARTS:
+            dropped = len(remaining)
             break
-        episodes.pop()  # oldest first, since the list is newest-first
-        dropped += 1
-    else:
-        print("ERROR: channel metadata alone exceeds the size ceiling", file=sys.stderr)
-        return 1
 
-    with open(OUTPUT_PATH, "wb") as fh:
-        fh.write(payload)
+    for i, chunk in enumerate(written):
+        payload = build_rss(*channel, chunk)
+        with open(part_path(i), "wb") as fh:
+            fh.write(payload)
+        span = f"{chunk[-1]['pubDate'][:16]} .. {chunk[0]['pubDate'][:16]}"
+        print(f"  {part_path(i):<14} {len(chunk):>3} episodes  {len(payload) / 1024:>6.1f} kB   {span}")
 
-    size_kb = len(payload) / 1024
-    print(f"Source episodes:  {len(parsed.entries)}")
-    print(f"Kept:             {len(episodes)}")
-    if dropped:
-        print(f"Dropped to fit:   {dropped} (oldest)")
-    print(f"Wrote {OUTPUT_PATH}: {size_kb:.1f} kB (ceiling {MAX_BYTES / 1024:.0f} kB)")
+    # Remove stale parts from a previous, larger run.
+    i = len(written)
+    while os.path.exists(part_path(i)):
+        os.remove(part_path(i))
+        print(f"  removed stale {part_path(i)}")
+        i += 1
+
+    print(f"Source episodes: {len(parsed.entries)}  |  kept: {sum(len(c) for c in written)}"
+          + (f"  |  dropped to fit: {dropped}" if dropped else ""))
     return 0
 
 
